@@ -175,4 +175,37 @@ describe("AgentChatPanel markdown rendering", () => {
     expect(screen.queryByText("read /tmp/README.md", { selector: "summary" })).toBeNull();
     expect(screen.queryByText(/"file_path"/)).toBeNull();
   });
+
+  it("renders assistant markdown links as new-tab links and drops unsafe protocols", () => {
+    render(
+      createElement(AgentChatPanel, {
+        agent: {
+          ...createAgent(),
+          outputLines: [
+            "> Review CLM-1004",
+            "**CLM-1004 - preliminary review complete**\n\n[Open Full Report](http://localhost:8502/?report=RVW-0123456789)\n\n[bad](javascript:alert(1))",
+          ],
+        },
+        isSelected: true,
+        canSend: true,
+        models,
+        stopBusy: false,
+        onLoadMoreHistory: vi.fn(),
+        onOpenSettings: vi.fn(),
+        onModelChange: vi.fn(),
+        onThinkingChange: vi.fn(),
+        onDraftChange: vi.fn(),
+        onSend: vi.fn(),
+        onStopRun: vi.fn(),
+        onAvatarShuffle: vi.fn(),
+      })
+    );
+
+    const link = screen.getByRole("link", { name: "Open Full Report" });
+    expect(link).toHaveAttribute("href", "http://localhost:8502/?report=RVW-0123456789");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+    const bad = screen.getByText("bad").closest("a");
+    expect(bad?.getAttribute("href") ?? "").not.toMatch(/javascript:/i);
+  });
 });

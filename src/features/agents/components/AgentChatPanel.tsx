@@ -11,7 +11,7 @@ import {
   type ReactNode,
 } from "react";
 import type { AgentState as AgentRecord } from "@/features/agents/state/store";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components as MarkdownComponents } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Check, ChevronRight, Clock, Mic, Paperclip, Pencil, Square, Trash2, X } from "lucide-react";
 import type { GatewayModelChoice } from "@/lib/gateway/models";
@@ -47,6 +47,13 @@ const formatDurationLabel = (durationMs: number): string => {
   if (!Number.isFinite(seconds) || seconds <= 0) return "0.0s";
   if (seconds < 10) return `${seconds.toFixed(1)}s`;
   return `${Math.round(seconds)}s`;
+};
+
+// Links in assistant replies open in a new tab so following them never navigates the
+// office away (custom-runtime chat history lives only in this page). react-markdown's
+// default URL filter still strips unsafe protocols such as javascript:.
+const ASSISTANT_MARKDOWN_COMPONENTS: MarkdownComponents = {
+  a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer" />,
 };
 
 const SPINE_LEFT = "left-[15px]";
@@ -501,13 +508,15 @@ const AssistantMessageCard = memo(function AssistantMessageCard({
                     }
                     return (
                       <div className="agent-markdown text-foreground">
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{rewritten}</ReactMarkdown>
+                        <ReactMarkdown remarkPlugins={[remarkGfm]} components={ASSISTANT_MARKDOWN_COMPONENTS}>
+                          {rewritten}
+                        </ReactMarkdown>
                       </div>
                     );
                   })()
                 ) : (
                   <div className="agent-markdown text-foreground">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={ASSISTANT_MARKDOWN_COMPONENTS}>
                       {rewriteMediaLinesToMarkdown(contentText)}
                     </ReactMarkdown>
                   </div>

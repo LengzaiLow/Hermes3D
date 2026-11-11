@@ -19,8 +19,17 @@ type SendDispatchAction =
 
 type SendDispatch = (action: SendDispatchAction) => void;
 
+type SessionSettingName = "model" | "thinkingLevel" | "execHost" | "execSecurity" | "execAsk";
+
 type GatewayClientLike = {
   call: (method: string, params: unknown) => Promise<unknown>;
+  /**
+   * Optional: session settings this runtime can actually apply. When present, the
+   * implicit first-send sync only includes these, so UI defaults (e.g. the store's
+   * fallback thinking level) are not pushed to runtimes that cannot honour them.
+   * Explicit user changes still go through sessions.patch and may be rejected.
+   */
+  supportedSessionSettings?: ReadonlySet<SessionSettingName>;
 };
 
 const extractImmediateAssistantText = (payload: unknown): string | null => {
@@ -178,14 +187,16 @@ export async function sendChatMessageViaStudio(params: {
     let createdSession = agent.sessionCreated;
     if (!agent.sessionSettingsSynced) {
       try {
+        const supported = params.client.supportedSessionSettings;
+        const include = (name: SessionSettingName) => !supported || supported.has(name);
         await syncGatewaySessionSettings({
           client: params.client as unknown as GatewayClient,
           sessionKey: params.sessionKey,
-          model: agent.model ?? null,
-          thinkingLevel: agent.thinkingLevel ?? null,
-          execHost: agent.sessionExecHost,
-          execSecurity: agent.sessionExecSecurity,
-          execAsk: agent.sessionExecAsk,
+          model: include("model") ? agent.model ?? null : undefined,
+          thinkingLevel: include("thinkingLevel") ? agent.thinkingLevel ?? null : undefined,
+          execHost: include("execHost") ? agent.sessionExecHost : undefined,
+          execSecurity: include("execSecurity") ? agent.sessionExecSecurity : undefined,
+          execAsk: include("execAsk") ? agent.sessionExecAsk : undefined,
         });
         createdSession = true;
         params.dispatch({

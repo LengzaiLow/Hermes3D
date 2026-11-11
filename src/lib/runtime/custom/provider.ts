@@ -239,6 +239,8 @@ export class CustomRuntimeProvider implements RuntimeProvider {
   readonly id: RuntimeProviderId;
   readonly label: string;
   readonly capabilities = CUSTOM_RUNTIME_CAPABILITIES;
+  /** Only the model can be configured per session; see callSessionsPatch. */
+  readonly supportedSessionSettings: ReadonlySet<"model"> = new Set(["model"] as const);
   readonly metadata;
   private readonly baseUrl: string;
   private readonly sessions = new Map<string, SessionRecord>();
@@ -290,6 +292,8 @@ export class CustomRuntimeProvider implements RuntimeProvider {
         return (await this.callSessionsPreview(params)) as T;
       case "chat.history":
         return (await this.callChatHistory(params)) as T;
+      case "sessions.patch":
+        return (await this.callSessionsPatch(params)) as T;
       case "chat.send":
         return (await this.callChatSend(params)) as T;
       case "agents.message":
@@ -397,8 +401,16 @@ export class CustomRuntimeProvider implements RuntimeProvider {
     const agentId = typeof params.agentId === "string" ? params.agentId.trim() : "";
     const descriptor = await this.describeRuntime();
     const modelChoices = normalizeModelChoices(descriptor.registry);
+    // Key the agent's session as its main session ("agent:<id>:main"), the same key
+    // fleet hydration searches for and chat.send uses.
     const sessions = agentId
-      ? [this.ensureSession(agentId, agentId, resolveDefaultModelId(descriptor.state, modelChoices))]
+      ? [
+          this.ensureSession(
+            buildAgentMainSessionKey(agentId, "main"),
+            agentId,
+            resolveDefaultModelId(descriptor.state, modelChoices)
+          ),
+        ]
       : [...this.sessions.values()];
     return {
       sessions: sessions.map((session) => ({
@@ -443,6 +455,9 @@ export class CustomRuntimeProvider implements RuntimeProvider {
         id,
         name: id,
         provider: "custom",
+        // Reasoning effort cannot be configured through the custom runtime seam;
+        // this hides the chat panel's thinking selector for these models.
+        reasoning: false,
       })),
     };
   }
@@ -586,6 +601,59 @@ export class CustomRuntimeProvider implements RuntimeProvider {
         }
       }
     }
+  }
+
+  /**
+   * Session settings sync. Custom runtimes have no thinking-level or exec-permission
+   * controls, so only "no override" (null/absent) is accepted for those. A model is
+   * accepted only when it is the runtime's default or listed in its /registry;
+   * anything else is rejected rather than silently ignored.
+   */
+  private async callSessionsPatch(rawParams: unknown) {
+    const params = isRecord(rawParams) ? rawParams : {};
+    const key = typeof params.key === "string" ? params.key.trim() : "";
+    if (!key) {
+      throw new Error("Custom runtime requires key for sessions.patch.");
+    }
+    const unsupported = (["thinkingLevel", "execHost", "execSecurity", "execAsk"] as const).filter(
+      (field) => resolveOptionalString(params[field]) !== null
+    );
+    if (unsupported.length > 0) {
+      throw new Error(
+        `Custom runtime does not support session settings: ${unsupported.join(", ")}.`
+      );
+    }
+    const descriptor = await this.describeRuntime();
+    const modelChoices = normalizeModelChoices(descriptor.registry);
+    const defaultModel = resolveDefaultModelId(descriptor.state, modelChoices);
+    let model = defaultModel;
+    const requestedModel = resolveOptionalString(params.model);
+    if (requestedModel) {
+      // Studio may send "<provider>/<model>"; strip this provider's own prefix only.
+      const prefix = `${this.id}/`;
+      const bareModel = requestedModel.startsWith(prefix)
+        ? requestedModel.slice(prefix.length)
+        : requestedModel;
+      if (bareModel !== defaultModel && !modelChoices.includes(bareModel)) {
+        const available = [defaultModel, ...modelChoices].filter(
+          (value, index, all): value is string => Boolean(value) && all.indexOf(value) === index
+        );
+        throw new Error(
+          `Custom runtime does not offer model "${requestedModel}". Available: ${
+            available.join(", ") || "none"
+          }.`
+        );
+      }
+      model = bareModel;
+    }
+    const agentId = parseAgentIdFromSessionKey(key) ?? "main";
+    const session = this.ensureSession(key, agentId, model);
+    session.model = model;
+    return {
+      ok: true as const,
+      key,
+      resolved: model ? { modelProvider: this.id, model } : undefined,
+    };
   }
 
   private async callAgentsMessage(rawParams: unknown) {
