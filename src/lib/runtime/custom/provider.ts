@@ -260,6 +260,10 @@ const OPS_FEED_PAGE_LIMIT = 200;
 const OPS_FEED_INITIAL_BACKOFF_MS = 1_000;
 const OPS_FEED_MAX_BACKOFF_MS = 30_000;
 const OPS_TOOL_NAME_RE = /^[a-z][a-z0-9_]{0,39}$/;
+/** Re-assert an open run this long after the office's fleet refresh has read the agent's history. */
+const OPS_REASSERT_DELAY_MS = 750;
+/** Only history reads this soon after a fleet refresh (agents.list) belong to that refresh. */
+const OPS_REASSERT_WINDOW_MS = 30_000;
 
 export type OpsFeedCapability = { eventsPath: string; agentsPath: string };
 
@@ -296,10 +300,17 @@ export const resolveOpsFeedCapability = (state: unknown): OpsFeedCapability | nu
   };
 };
 
+/**
+ * Frame streams used: "lifecycle" (start/end/error) and "tool" are the office's own vocabulary.
+ * "activity" carries no content: the office only marks the agent active and does not change its
+ * status (it is dropped for a run that is not the agent's current run). It is sent only on backend
+ * evidence that the run is still working, so the office does not treat a long model call as
+ * silence (after 120 s without events it re-reads the fleet and would reset the agent to idle).
+ */
 const opsAgentFrame = (
   runId: string,
   sessionKey: string,
-  stream: "lifecycle" | "tool",
+  stream: "lifecycle" | "tool" | "activity",
   data: Record<string, unknown>
 ): EventFrame => ({
   type: "event",
@@ -347,6 +358,9 @@ export const translateOpsFeedEvent = (
   const sessionKey = openRuns.get(runId);
   if (!sessionKey) return [];
   switch (event.kind) {
+    case "agent.model_call":
+      // A recorded model round: evidence the agent is working; no content is shown.
+      return [opsAgentFrame(runId, sessionKey, "activity", { source: "fmi-ops", kind: "model_call" })];
     case "agent.tool":
       return [
         opsToolFrame(event, runId, sessionKey, String(data.tool ?? "tool"), {
@@ -544,10 +558,34 @@ export class OpsFeedSubscription {
       if (run) working.add(run.runId);
     }
     for (const [runId, sessionKey] of [...this.openRuns]) {
-      if (working.has(runId)) continue;
+      if (working.has(runId)) {
+        // Still recorded as working (running step + runner lock): keep the office from
+        // mistaking a long model call for silence.
+        this.emit(opsAgentFrame(runId, sessionKey, "activity", { source: "fmi-ops", kind: "still_working" }));
+        continue;
+      }
       this.openRuns.delete(runId);
       this.emit(opsAgentFrame(runId, sessionKey, "lifecycle", { phase: "error" }));
     }
+  }
+
+  /** The open feed run for this session, if any. */
+  openRunFor(sessionKey: string): string | null {
+    for (const [runId, key] of this.openRuns) {
+      if (key === sessionKey) return runId;
+    }
+    return null;
+  }
+
+  /**
+   * Show an open run as started again. Used after the office re-reads its fleet: that refresh
+   * infers "idle" for any agent without a pending chat reply, which a feed run never has.
+   */
+  reassertOpenRun(sessionKey: string): boolean {
+    const runId = this.openRunFor(sessionKey);
+    if (!runId || this.stopped) return false;
+    this.emit(opsAgentFrame(runId, sessionKey, "lifecycle", { phase: "start" }));
+    return true;
   }
 
   private workingRun(agent: unknown): { runId: string; sessionKey: string } | null {
@@ -601,6 +639,10 @@ export class CustomRuntimeProvider implements RuntimeProvider {
   private readonly activeRunIdBySessionKey = new Map<string, string>();
   private opsFeed: OpsFeedSubscription | null = null;
   private unregisterOpsFeed: (() => void) | null = null;
+  /** When the office last re-read its fleet (agents.list), and which runs were re-asserted since. */
+  private opsFleetRefreshAt = 0;
+  private readonly opsReassertedAt = new Map<string, number>();
+  private readonly opsReassertTimers = new Set<ReturnType<typeof setTimeout>>();
 
   constructor(
     readonly client: GatewayClient,
@@ -740,6 +782,7 @@ export class CustomRuntimeProvider implements RuntimeProvider {
     // The office lists agents once it is connected: follow the operations feed from here
     // if this runtime advertises one (and only then).
     this.syncOpsFeed(descriptor.state);
+    if (this.opsFeed) this.opsFleetRefreshAt = Date.now();
     const runtimeName = descriptor.metadata.runtimeName ?? this.metadata.runtimeName ?? "Custom Runtime";
     const agents = buildSyntheticAgents(descriptor.state, runtimeName);
     return {
@@ -852,6 +895,7 @@ export class CustomRuntimeProvider implements RuntimeProvider {
       throw new Error("Custom runtime requires sessionKey for chat.history.");
     }
     const session = this.sessions.get(sessionKey) ?? null;
+    this.scheduleOpsReassert(sessionKey);
     return {
       sessionKey,
       messages: (session?.messages ?? []).map((message) => ({
@@ -1157,11 +1201,36 @@ export class CustomRuntimeProvider implements RuntimeProvider {
     void subscription.start();
   }
 
+  /**
+   * After a fleet refresh the office infers each agent's status from its chat history (this call
+   * is the inference's last step) and resets an agent without a pending chat reply to idle. If the
+   * feed still holds that agent's run open, show it as started again once the refresh has been
+   * applied. Once per run per refresh; never while the agent has a chat run of its own.
+   */
+  private scheduleOpsReassert(sessionKey: string): void {
+    const feed = this.opsFeed;
+    if (!feed || feed.isStopped || this.activeRunIdBySessionKey.has(sessionKey)) return;
+    if (Date.now() - this.opsFleetRefreshAt > OPS_REASSERT_WINDOW_MS) return;
+    const runId = feed.openRunFor(sessionKey);
+    if (!runId || (this.opsReassertedAt.get(runId) ?? 0) >= this.opsFleetRefreshAt) return;
+    this.opsReassertedAt.set(runId, Date.now());
+    const timer = setTimeout(() => {
+      this.opsReassertTimers.delete(timer);
+      if (this.opsFeed === feed && !this.activeRunIdBySessionKey.has(sessionKey)) {
+        feed.reassertOpenRun(sessionKey);
+      }
+    }, OPS_REASSERT_DELAY_MS);
+    this.opsReassertTimers.add(timer);
+  }
+
   private stopOpsFeed(): void {
     const subscription = this.opsFeed;
     const unregister = this.unregisterOpsFeed;
     this.opsFeed = null;
     this.unregisterOpsFeed = null;
+    this.opsReassertTimers.forEach((timer) => clearTimeout(timer));
+    this.opsReassertTimers.clear();
+    this.opsReassertedAt.clear();
     subscription?.stop();
     unregister?.();
   }

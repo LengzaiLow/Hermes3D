@@ -122,7 +122,8 @@ const payloadOf = (frame: EventFrame) =>
 
 const describeFrame = (frame: EventFrame): string => {
   const p = payloadOf(frame);
-  const what = p.stream === "lifecycle" ? String(p.data.phase) : String(p.data.name);
+  const what =
+    p.stream === "lifecycle" ? String(p.data.phase) : p.stream === "activity" ? String(p.data.kind) : String(p.data.name);
   return `${p.sessionKey.split(":")[1]} ${p.runId} ${p.stream}:${what}`;
 };
 
@@ -268,6 +269,7 @@ describe("translating recorded events into office frames", () => {
     const frames = RECORDED.flatMap((event) => translateOpsFeedEvent(event, openRuns));
     expect(frames.map(describeFrame)).toEqual([
       "business-operations RUN-B1 lifecycle:start",
+      "business-operations RUN-B1 activity:model_call", // a recorded model round: activity, no content
       "business-operations RUN-B1 tool:search_knowledge",
       "business-operations RUN-B1 tool:step_outcome",
       "business-operations RUN-B1 tool:handoff",
@@ -280,17 +282,18 @@ describe("translating recorded events into office frames", () => {
     ]);
     expect(openRuns.size).toBe(0);
     const data = frames.map((frame) => payloadOf(frame).data);
-    expect(data[2]).toMatchObject({ arguments: { task: "analyse_proposal", output: "model output" } });
-    expect(data[3]).toMatchObject({
+    expect(data[1]).toEqual({ source: "fmi-ops", kind: "model_call" });
+    expect(data[3]).toMatchObject({ arguments: { task: "analyse_proposal", output: "model output" } });
+    expect(data[4]).toMatchObject({
       arguments: { from: "business-operations", to: "risk-compliance", consultation: "requested" },
     });
-    expect(data[7]).toMatchObject({
+    expect(data[8]).toMatchObject({
       arguments: { output: "DETERMINISTIC FALLBACK (not model output)" },
     });
-    expect(data[8]).toMatchObject({
+    expect(data[9]).toMatchObject({
       arguments: { to: "business-operations", outcome: "incomplete", successful: false },
     });
-    expect(data[1]).toMatchObject({ toolCallId: "ops-8", phase: "call" });
+    expect(data[2]).toMatchObject({ toolCallId: "ops-8", phase: "call" });
     expect(frames.every((frame) => frame.seq === undefined)).toBe(true); // no gap-detection seq
   });
 
@@ -358,7 +361,90 @@ describe("translating recorded events into office frames", () => {
   });
 });
 
+const officeHandler = (agents: AgentState[]) => {
+  const lines: Array<{ agentId: string; line: string }> = [];
+  const statuses: string[] = [];
+  const apply = (agentId: string, patch: Partial<AgentState>) => {
+    const index = agents.findIndex((agent) => agent.agentId === agentId);
+    agents[index] = { ...agents[index]!, ...patch };
+    if (patch.status) statuses.push(`${agentId}:${patch.status}`);
+  };
+  const handler = createGatewayRuntimeEventHandler({
+    getStatus: () => "connected",
+    getAgents: () => agents,
+    dispatch: (action) => {
+      const a = action as { type: string; agentId: string; line?: string; patch?: Partial<AgentState> };
+      if (a.type === "appendOutput" && a.line) lines.push({ agentId: a.agentId, line: a.line });
+      if (a.type === "updateAgent" && a.patch) apply(a.agentId, a.patch);
+    },
+    queueLivePatch: (agentId, patch) => apply(agentId, patch),
+    clearPendingLivePatch: vi.fn(),
+    now: () => 1_000,
+    loadSummarySnapshot: vi.fn(async () => {}),
+    requestHistoryRefresh: vi.fn(async () => {}),
+    refreshHeartbeatLatestUpdate: vi.fn(),
+    bumpHeartbeatTick: vi.fn(),
+    setTimeout: (fn, ms) => setTimeout(fn, ms) as unknown as number,
+    clearTimeout: (id) => clearTimeout(id as unknown as NodeJS.Timeout),
+    isDisconnectLikeError: () => false,
+    logWarn: vi.fn(),
+    updateSpecialLatestUpdate: vi.fn(),
+  });
+  return { handler, lines, statuses, apply };
+};
+
 describe("through the office's own runtime event handler", () => {
+  it("activity frames keep a working agent working and add nothing to its transcript", () => {
+    const agents = [createAgent("risk-compliance", RISK)];
+    const { handler, lines, statuses } = officeHandler(agents);
+    try {
+      const openRuns = new Map<string, string>();
+      const frames = [
+        { seq: 1, kind: "agent.started", agentId: "risk-compliance", runId: "R", phase: "start" },
+        { seq: 2, kind: "agent.model_call", runId: "R" },
+      ].flatMap((event) => translateOpsFeedEvent(event as OpsFeedEvent, openRuns));
+      frames.forEach((frame) => handler.handleEvent(frame));
+    } finally {
+      handler.dispose();
+    }
+    expect(agents[0]).toMatchObject({ status: "running", runId: "R" });
+    expect(statuses).toEqual(["risk-compliance:running"]);
+    expect(lines).toEqual([]);
+  });
+
+  it("shows the recorded failure even after the office's fleet refresh reset the agent to idle", () => {
+    // Live finding: after 120 s without events (a long model call), or on window focus, the office
+    // re-reads its fleet and infers "idle" for an agent without a pending chat reply. Without a
+    // re-assert, the run's later error frame is then dropped and the failure never shows.
+    const run = (reassert: boolean) => {
+      const agents = [createAgent("risk-compliance", RISK)];
+      const { handler, apply } = officeHandler(agents);
+      try {
+        const openRuns = new Map<string, string>();
+        const start = { seq: 1, kind: "agent.started", agentId: "risk-compliance", runId: "R", phase: "start" };
+        translateOpsFeedEvent(start as OpsFeedEvent, openRuns).forEach((f) => handler.handleEvent(f));
+        apply("risk-compliance", { status: "idle", runId: null }); // the office's fleet-refresh inference
+        if (reassert) {
+          const again = new OpsFeedSubscription({
+            eventsPath: "/ops/events",
+            agentsPath: "/ops/agents",
+            request: async () => ({}),
+            dispatch: (frame) => handler.handleEvent(frame),
+          });
+          again.openRuns.set("R", RISK);
+          expect(again.reassertOpenRun(RISK)).toBe(true);
+        }
+        const end = { seq: 2, kind: "agent.step_completed", runId: "R", phase: "error" };
+        translateOpsFeedEvent(end as OpsFeedEvent, openRuns).forEach((f) => handler.handleEvent(f));
+      } finally {
+        handler.dispose();
+      }
+      return agents[0]!.status;
+    };
+    expect(run(false)).toBe("idle"); // the hazard: the recorded failure would be invisible
+    expect(run(true)).toBe("error"); // with the re-assert, the office shows what was recorded
+  });
+
   it("shows Business working then idle, Risk working then in error, with the tool lines", () => {
     const agents = [
       createAgent("business-operations", BUSINESS),
@@ -569,14 +655,14 @@ describe("following the feed", () => {
       21
     );
     await vi.waitFor(() => expect(calls).toBeGreaterThanOrEqual(3)); // reconciled while still working
-    expect(frames.map(describeFrame)).toEqual(["risk-compliance R lifecycle:start"]);
+    const lifecycle = () => frames.filter((f) => payloadOf(f).stream === "lifecycle").map(describeFrame);
+    expect(lifecycle()).toEqual(["risk-compliance R lifecycle:start"]);
+    // each confirmation that the run is still working keeps the office from seeing silence
+    expect(frames.map(describeFrame)).toContain("risk-compliance R activity:still_working");
     processDied = true;
-    await vi.waitFor(() => expect(frames).toHaveLength(2));
+    await vi.waitFor(() => expect(lifecycle()).toHaveLength(2));
     expect(request).toHaveBeenCalled();
-    expect(frames.map(describeFrame)).toEqual([
-      "risk-compliance R lifecycle:start",
-      "risk-compliance R lifecycle:error",
-    ]);
+    expect(lifecycle()).toEqual(["risk-compliance R lifecycle:start", "risk-compliance R lifecycle:error"]);
     subscription.stop();
     await done;
   });
@@ -732,6 +818,114 @@ describe("the custom runtime provider", () => {
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(proxied.some((body) => body.pathname.startsWith("/ops/"))).toBe(false);
     expect(handlers).not.toHaveBeenCalled();
+  });
+
+  it("re-asserts an open run after the office's fleet refresh reads that agent's history", async () => {
+    installGatewayFetch({
+      agents: () => agentsPayload(40, [{ agentId: "risk-compliance", runId: "RUN-R1" }]),
+      pages: [],
+    });
+    const client = new GatewayClient();
+    const received: EventFrame[] = [];
+    client.onEvent((frame) => received.push(frame));
+    const provider = providerFor(client);
+    await provider.call("agents.list", {}); // the office's fleet refresh
+    await vi.waitFor(() => expect(received.map(describeFrame)).toEqual(["risk-compliance RUN-R1 lifecycle:start"]));
+    // the refresh's status inference reads each agent's history, then resets agents to idle
+    await provider.call("chat.history", { sessionKey: RISK });
+    await provider.call("chat.history", { sessionKey: BUSINESS }); // no open run: nothing to re-assert
+    await provider.call("chat.history", { sessionKey: RISK }); // same refresh: only once
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    expect(received.map(describeFrame)).toEqual([
+      "risk-compliance RUN-R1 lifecycle:start",
+      "risk-compliance RUN-R1 lifecycle:start",
+    ]);
+    client.disconnect();
+  });
+
+  it("never re-asserts over the agent's own chat run", async () => {
+    installGatewayFetch({
+      agents: () => agentsPayload(40, [{ agentId: "risk-compliance", runId: "RUN-R1" }]),
+      pages: [],
+    });
+    const client = new GatewayClient();
+    const received: EventFrame[] = [];
+    client.onEvent((frame) => received.push(frame));
+    const provider = providerFor(client);
+    await provider.call("agents.list", {});
+    await vi.waitFor(() => expect(received).toHaveLength(1));
+    const realFetch = globalThis.fetch;
+    let release: () => void = () => {};
+    let chatInFlight = false;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as ProxyBody;
+      if (body.pathname === "/v1/chat/completions") {
+        chatInFlight = true;
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      }
+      return realFetch(input, init);
+    });
+    const chat = provider.call("chat.send", { sessionKey: RISK, message: "status", idempotencyKey: "chat-1" });
+    await vi.waitFor(() => expect(chatInFlight).toBe(true)); // the person's chat run is now active
+    await provider.call("chat.history", { sessionKey: RISK });
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    expect(received).toHaveLength(1); // no re-assert while the person's chat run is active
+    release();
+    await chat;
+    client.disconnect();
+  });
+
+  it("cancels a scheduled re-assert if the person starts a chat with that agent meanwhile", async () => {
+    installGatewayFetch({
+      agents: () => agentsPayload(40, [{ agentId: "risk-compliance", runId: "RUN-R1" }]),
+      pages: [],
+    });
+    const client = new GatewayClient();
+    const received: EventFrame[] = [];
+    client.onEvent((frame) => received.push(frame));
+    const provider = providerFor(client);
+    await provider.call("agents.list", {});
+    await vi.waitFor(() => expect(received).toHaveLength(1));
+    await provider.call("chat.history", { sessionKey: RISK }); // re-assert scheduled (750 ms)
+    const realFetch = globalThis.fetch;
+    let release: () => void = () => {};
+    let chatInFlight = false;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as ProxyBody;
+      if (body.pathname === "/v1/chat/completions") {
+        chatInFlight = true;
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      }
+      return realFetch(input, init);
+    });
+    const chat = provider.call("chat.send", { sessionKey: RISK, message: "status", idempotencyKey: "chat-2" });
+    await vi.waitFor(() => expect(chatInFlight).toBe(true));
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    expect(received).toHaveLength(1); // the chat run owns the agent now: no feed start over it
+    release();
+    await chat;
+    client.disconnect();
+  });
+
+  it("re-asserts only the given agent's own open run", () => {
+    const frames: EventFrame[] = [];
+    const subscription = new OpsFeedSubscription({
+      eventsPath: "/ops/events",
+      agentsPath: "/ops/agents",
+      request: async () => ({}),
+      dispatch: (frame) => frames.push(frame),
+    });
+    subscription.openRuns.set("RUN-R1", RISK);
+    expect(subscription.reassertOpenRun(BUSINESS)).toBe(false); // Business has no open run
+    expect(frames).toEqual([]);
+    expect(subscription.reassertOpenRun(RISK)).toBe(true);
+    expect(frames.map(describeFrame)).toEqual(["risk-compliance RUN-R1 lifecycle:start"]);
+    subscription.stop();
+    expect(subscription.reassertOpenRun(RISK)).toBe(false); // nothing after stop
   });
 
   it("does not touch a client without local event support (older or fake clients)", async () => {
