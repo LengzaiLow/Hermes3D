@@ -923,7 +923,68 @@ export const createOfficeAnimationTriggerState =
     workingUntilByAgentId: emptyObject(),
   });
 
-export const reduceOfficeAnimationTriggerEvent = (params: {
+const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value) && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype;
+
+/** Structural equality for the trigger state's plain data (records, arrays, primitives). */
+const isEquivalentTriggerValue = (a: unknown, b: unknown): boolean => {
+  if (Object.is(a, b)) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((item, index) => isEquivalentTriggerValue(item, b[index]));
+  }
+  if (isPlainObject(a) && isPlainObject(b)) {
+    const keys = Object.keys(a);
+    return (
+      keys.length === Object.keys(b).length &&
+      keys.every(
+        (key) =>
+          Object.prototype.hasOwnProperty.call(b, key) && isEquivalentTriggerValue(a[key], b[key]),
+      )
+    );
+  }
+  return false;
+};
+
+/**
+ * Return `previous` when `next` holds the same content. React may apply a queued state updater
+ * more than once (it replays updates while rebasing skipped lower-priority ones, e.g. idle-lane
+ * updates). An updater that returns a new object every time then makes every replay a "change",
+ * which re-fires every memo and effect that depends on the trigger state: the OfficeScreen
+ * "Maximum update depth" render loop.
+ */
+export const keepOfficeAnimationTriggerStateIfUnchanged = (
+  previous: OfficeAnimationTriggerState,
+  next: OfficeAnimationTriggerState,
+): OfficeAnimationTriggerState =>
+  isEquivalentTriggerValue(previous, next) ? previous : next;
+
+/**
+ * Wrap a state updater so that React replaying the same queued update against the same state gets
+ * the same result object back. While an earlier lower-priority update is pending, React re-applies
+ * the later queued updaters to the older base state on every render. An updater that builds a new
+ * object on each application would then look like a fresh change on every render, even though its
+ * content is the same (the OfficeScreen render loop when an agent is working).
+ */
+export const createReplaySafeUpdater = <T>(compute: (previous: T) => T): ((previous: T) => T) => {
+  let last: { input: T; output: T } | null = null;
+  return (previous: T): T => {
+    if (last && Object.is(last.input, previous)) return last.output;
+    const output = compute(previous);
+    last = { input: previous, output };
+    return output;
+  };
+};
+
+/** Drop entries whose time has passed; the same object when nothing expired. */
+export const dropExpiredUntilEntries = (
+  entries: Record<string, number>,
+  nowMs: number,
+): Record<string, number> => {
+  const kept = Object.entries(entries).filter(([, until]) => until > nowMs);
+  return kept.length === Object.keys(entries).length ? entries : Object.fromEntries(kept);
+};
+
+const computeOfficeAnimationTriggerEvent = (params: {
   agents: AgentState[];
   event: EventFrame;
   nowMs?: number;
@@ -1071,7 +1132,12 @@ export const reduceOfficeAnimationTriggerEvent = (params: {
   return next;
 };
 
-export const reconcileOfficeAnimationTriggerState = (params: {
+export const reduceOfficeAnimationTriggerEvent = (
+  params: Parameters<typeof computeOfficeAnimationTriggerEvent>[0],
+): OfficeAnimationTriggerState =>
+  keepOfficeAnimationTriggerStateIfUnchanged(params.state, computeOfficeAnimationTriggerEvent(params));
+
+const computeReconciledOfficeAnimationTriggerState = (params: {
   agents: AgentState[];
   nowMs?: number;
   state: OfficeAnimationTriggerState;
@@ -1267,7 +1333,15 @@ export const reconcileOfficeAnimationTriggerState = (params: {
   };
 };
 
-export const clearOfficeAnimationTriggerHold = (params: {
+export const reconcileOfficeAnimationTriggerState = (
+  params: Parameters<typeof computeReconciledOfficeAnimationTriggerState>[0],
+): OfficeAnimationTriggerState =>
+  keepOfficeAnimationTriggerStateIfUnchanged(
+    params.state,
+    computeReconciledOfficeAnimationTriggerState(params),
+  );
+
+const computeClearedOfficeAnimationTriggerHold = (params: {
   agentId: string;
   hold: "github" | "qa" | "call" | "text";
   state: OfficeAnimationTriggerState;
@@ -1334,6 +1408,14 @@ export const clearOfficeAnimationTriggerHold = (params: {
       : next.suppressedQaDirectiveKeyByAgentId,
   };
 };
+
+export const clearOfficeAnimationTriggerHold = (
+  params: Parameters<typeof computeClearedOfficeAnimationTriggerHold>[0],
+): OfficeAnimationTriggerState =>
+  keepOfficeAnimationTriggerStateIfUnchanged(
+    params.state,
+    computeClearedOfficeAnimationTriggerHold(params),
+  );
 
 export const buildOfficeAnimationState = (params: {
   agents: AgentState[];

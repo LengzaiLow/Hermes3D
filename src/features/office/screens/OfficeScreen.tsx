@@ -187,6 +187,8 @@ import {
   buildOfficeAnimationState,
   clearOfficeAnimationTriggerHold,
   createOfficeAnimationTriggerState,
+  createReplaySafeUpdater,
+  dropExpiredUntilEntries,
   reconcileOfficeAnimationTriggerState,
   reduceOfficeAnimationTriggerEvent,
   type OfficePhoneCallRequest,
@@ -1119,13 +1121,15 @@ export function OfficeScreen({
     const handlePlaybackStarted = () => {
       const now = Date.now();
       const until = now + OFFICE_DANCE_MS;
-      setDanceUntilByAgentId((previous) => {
-        const next: Record<string, number> = {};
-        for (const agent of state.agents) {
-          next[agent.agentId] = until;
-        }
-        return { ...previous, ...next };
-      });
+      setDanceUntilByAgentId(
+        createReplaySafeUpdater((previous) => {
+          const next: Record<string, number> = {};
+          for (const agent of state.agents) {
+            next[agent.agentId] = until;
+          }
+          return { ...previous, ...next };
+        }),
+      );
     };
     window.addEventListener(
       SOUNDHERMES_PLAYBACK_STARTED_EVENT_NAME,
@@ -1140,10 +1144,9 @@ export function OfficeScreen({
   }, [state.agents]);
   useEffect(() => {
     const now = Date.now();
-    setDanceUntilByAgentId((previous) =>
-      Object.fromEntries(
-        Object.entries(previous).filter(([, until]) => until > now),
-      ),
+    // Replay-safe and the same object when nothing expired (see eventTriggers).
+    setDanceUntilByAgentId(
+      createReplaySafeUpdater((previous) => dropExpiredUntilEntries(previous, now)),
     );
   }, [state.agents]);
   useEffect(() => {
@@ -2616,11 +2619,17 @@ export function OfficeScreen({
     // Run reconciliation before subscribing to events so dedup keys are
     // populated in the trigger state. This prevents stale gateway event
     // replays from setting timed room holds on page load.
-    setOfficeTriggerState((previous) =>
-      reconcileOfficeAnimationTriggerState({
-        state: previous,
-        agents: stateRef.current.agents,
-      }),
+    // Inputs are captured when the update is queued, so a replayed updater is deterministic.
+    const reconcileAgents = stateRef.current.agents;
+    const reconcileNowMs = Date.now();
+    setOfficeTriggerState(
+      createReplaySafeUpdater((previous) =>
+        reconcileOfficeAnimationTriggerState({
+          state: previous,
+          agents: reconcileAgents,
+          nowMs: reconcileNowMs,
+        }),
+      ),
     );
     const unsubscribeEvent = client.onEvent((event) => {
       lastGatewayActivityAtRef.current = Date.now();
@@ -2629,12 +2638,17 @@ export function OfficeScreen({
         return next.slice(-MAX_HERMES_LOG_ENTRIES);
       });
       refreshRecentTransportSessionHistory(event);
-      setOfficeTriggerState((previous) =>
-        reduceOfficeAnimationTriggerEvent({
-          state: previous,
-          event,
-          agents: stateRef.current.agents,
-        }),
+      const eventAgents = stateRef.current.agents;
+      const eventNowMs = Date.now();
+      setOfficeTriggerState(
+        createReplaySafeUpdater((previous) =>
+          reduceOfficeAnimationTriggerEvent({
+            state: previous,
+            event,
+            agents: eventAgents,
+            nowMs: eventNowMs,
+          }),
+        ),
       );
       if (debugEnabled) {
         console.info("[office-debug] Gateway event.", {
@@ -2730,11 +2744,15 @@ export function OfficeScreen({
   }, [agentsLoaded, loadAgents, status]);
 
   useEffect(() => {
-    setOfficeTriggerState((previous) =>
-      reconcileOfficeAnimationTriggerState({
-        state: previous,
-        agents: state.agents,
-      }),
+    const nowMs = Date.now();
+    setOfficeTriggerState(
+      createReplaySafeUpdater((previous) =>
+        reconcileOfficeAnimationTriggerState({
+          state: previous,
+          agents: state.agents,
+          nowMs,
+        }),
+      ),
     );
   }, [state.agents]);
 
@@ -3218,12 +3236,14 @@ export function OfficeScreen({
           line: buildPhoneCallOutputLine(`Call with ${request.callee} finished.`),
         });
       }
-      setOfficeTriggerState((previous) =>
-        clearOfficeAnimationTriggerHold({
-          state: previous,
-          hold: "call",
-          agentId,
-        }),
+      setOfficeTriggerState(
+        createReplaySafeUpdater((previous) =>
+          clearOfficeAnimationTriggerHold({
+            state: previous,
+            hold: "call",
+            agentId,
+          }),
+        ),
       );
     },
     [dispatch, phoneCallByAgentId],
@@ -3369,12 +3389,14 @@ export function OfficeScreen({
           line: buildTextMessageOutputLine(`Message to ${request.recipient} sent.`),
         });
       }
-      setOfficeTriggerState((previous) =>
-        clearOfficeAnimationTriggerHold({
-          state: previous,
-          hold: "text",
-          agentId,
-        }),
+      setOfficeTriggerState(
+        createReplaySafeUpdater((previous) =>
+          clearOfficeAnimationTriggerHold({
+            state: previous,
+            hold: "text",
+            agentId,
+          }),
+        ),
       );
     },
     [dispatch, textMessageByAgentId],
@@ -3650,23 +3672,27 @@ export function OfficeScreen({
 
   const handleGithubReviewDismiss = useCallback(() => {
     if (!githubReviewAgentId) return;
-    setOfficeTriggerState((previous) =>
-      clearOfficeAnimationTriggerHold({
-        state: previous,
-        hold: "github",
-        agentId: githubReviewAgentId,
-      }),
+    setOfficeTriggerState(
+      createReplaySafeUpdater((previous) =>
+        clearOfficeAnimationTriggerHold({
+          state: previous,
+          hold: "github",
+          agentId: githubReviewAgentId,
+        }),
+      ),
     );
   }, [githubReviewAgentId]);
 
   const handleQaDismiss = useCallback(() => {
     if (!qaTestingAgentId) return;
-    setOfficeTriggerState((previous) =>
-      clearOfficeAnimationTriggerHold({
-        state: previous,
-        hold: "qa",
-        agentId: qaTestingAgentId,
-      }),
+    setOfficeTriggerState(
+      createReplaySafeUpdater((previous) =>
+        clearOfficeAnimationTriggerHold({
+          state: previous,
+          hold: "qa",
+          agentId: qaTestingAgentId,
+        }),
+      ),
     );
   }, [qaTestingAgentId]);
 
@@ -3735,25 +3761,27 @@ export function OfficeScreen({
       ) {
         const nowMs = Date.now();
         const runId = randomUUID();
-        setOfficeTriggerState((previous) =>
-          reduceOfficeAnimationTriggerEvent({
-            state: previous,
-            agents: stateRef.current.agents,
-            nowMs,
-            event: {
-              type: "event",
-              event: "chat",
-              payload: {
-                runId,
-                sessionKey,
-                state: "final",
-                message: {
-                  role: "user",
-                  content: trimmed,
+        setOfficeTriggerState(
+          createReplaySafeUpdater((previous) =>
+            reduceOfficeAnimationTriggerEvent({
+              state: previous,
+              agents: stateRef.current.agents,
+              nowMs,
+              event: {
+                type: "event",
+                event: "chat",
+                payload: {
+                  runId,
+                  sessionKey,
+                  state: "final",
+                  message: {
+                    role: "user",
+                    content: trimmed,
+                  },
                 },
               },
-            },
-          }),
+            }),
+          ),
         );
       }
 
@@ -3783,25 +3811,27 @@ export function OfficeScreen({
             confirmed: true,
           },
         });
-        setOfficeTriggerState((previous) =>
-          reduceOfficeAnimationTriggerEvent({
-            state: previous,
-            agents: stateRef.current.agents,
-            nowMs,
-            event: {
-              type: "event",
-              event: "chat",
-              payload: {
-                runId,
-                sessionKey,
-                state: "final",
-                message: {
-                  role: "user",
-                  content: trimmed,
+        setOfficeTriggerState(
+          createReplaySafeUpdater((previous) =>
+            reduceOfficeAnimationTriggerEvent({
+              state: previous,
+              agents: stateRef.current.agents,
+              nowMs,
+              event: {
+                type: "event",
+                event: "chat",
+                payload: {
+                  runId,
+                  sessionKey,
+                  state: "final",
+                  message: {
+                    role: "user",
+                    content: trimmed,
+                  },
                 },
               },
-            },
-          }),
+            }),
+          ),
         );
         return;
       }
