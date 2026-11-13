@@ -247,6 +247,8 @@ export class GatewayClient {
   private manualDisconnect = false;
   private lastHello: GatewayHelloOk | null = null;
   private _lastDisconnectCode: number | null = null;
+  /** Stop functions of local event sources (e.g. a Custom Runtime's event feed), by key. */
+  private localEventSources = new Map<string, () => void>();
 
   onStatus(handler: StatusHandler) {
     this.statusHandlers.add(handler);
@@ -268,6 +270,50 @@ export class GatewayClient {
     return () => {
       this.gapHandlers.delete(handler);
     };
+  }
+
+  /**
+   * Deliver an event frame produced locally, not received over the gateway WebSocket, to the
+   * registered event handlers. Runtime providers without a WebSocket (Custom Runtimes) use it
+   * to replay the runtime's own activity feed as the frames the office already understands.
+   * `seq` and `stateVersion` are dropped, so local frames never affect gap detection.
+   */
+  dispatchLocalEvent(event: EventFrame) {
+    if (event?.type !== "event" || typeof event.event !== "string" || !event.event) return;
+    const frame: EventFrame = { type: "event", event: event.event, payload: event.payload };
+    this.eventHandlers.forEach((handler) => handler(frame));
+  }
+
+  /**
+   * Register the stop function of a local event source. At most one source runs per key:
+   * registering a new one stops the previous one. `disconnect()` stops every source, also when
+   * no WebSocket is open (Custom Runtimes never open one). Returns an unregister function.
+   */
+  registerLocalEventSource(key: string, stop: () => void): () => void {
+    const previous = this.localEventSources.get(key);
+    this.localEventSources.set(key, stop);
+    if (previous && previous !== stop) {
+      this.runLocalEventSourceStop(previous);
+    }
+    return () => {
+      if (this.localEventSources.get(key) === stop) {
+        this.localEventSources.delete(key);
+      }
+    };
+  }
+
+  private stopLocalEventSources() {
+    const stops = [...this.localEventSources.values()];
+    this.localEventSources.clear();
+    stops.forEach((stop) => this.runLocalEventSourceStop(stop));
+  }
+
+  private runLocalEventSourceStop(stop: () => void) {
+    try {
+      stop();
+    } catch (err) {
+      console.warn("Failed to stop a local event source.", err);
+    }
   }
 
   async connect(options: GatewayConnectOptions) {
@@ -369,6 +415,8 @@ export class GatewayClient {
   }
 
   disconnect() {
+    // Custom Runtimes have no WebSocket client, so stop their local event sources first.
+    this.stopLocalEventSources();
     if (!this.client) {
       return;
     }
